@@ -1,8 +1,11 @@
 ﻿using Newtonsoft.Json;
 using System;
+using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Net;
+using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace SteamAuth
@@ -90,7 +93,7 @@ namespace SteamAuth
             addAuthenticatorBody.Add("authenticator_type", "1");
             addAuthenticatorBody.Add("device_identifier", this.DeviceID);
             addAuthenticatorBody.Add("sms_phone_id", "1");
-            string addAuthenticatorResponseStr = await SteamWeb.POSTRequest("https://api.steampowered.com/ITwoFactorService/AddAuthenticator/v1/?access_token=" + this.Session.AccessToken, null, addAuthenticatorBody);
+            string addAuthenticatorResponseStr = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/AddAuthenticator/v1/?access_token=" + this.Session.AccessToken, null, addAuthenticatorBody);
 
             // Parse response json to object
             var addAuthenticatorResponse = JsonConvert.DeserializeObject<AddAuthenticatorResponse>(addAuthenticatorResponseStr);
@@ -156,7 +159,7 @@ namespace SteamAuth
                 NameValueCollection finalizeAuthenticatorValues = new NameValueCollection();
                 finalizeAuthenticatorValues.Add("steamid", this.Session.SteamID.ToString());
                 finalizeAuthenticatorValues.Add("authenticator_code", LinkedAccount.GenerateSteamGuardCode());
-                finalizeAuthenticatorValues.Add("authenticator_time", TimeAligner.GetSteamTime().ToString());
+                finalizeAuthenticatorValues.Add("authenticator_time", (await TimeAligner.GetSteamTimeAsync()).ToString());
                 finalizeAuthenticatorValues.Add("activation_code", smsCode);
                 finalizeAuthenticatorValues.Add("validate_sms_code", "1");
 
@@ -165,7 +168,7 @@ namespace SteamAuth
                 {
                     wc.Encoding = Encoding.UTF8;
                     wc.Headers[HttpRequestHeader.UserAgent] = SteamWeb.MOBILE_APP_USER_AGENT;
-                    byte[] finalizeAuthenticatorResult = await wc.UploadValuesTaskAsync(new Uri("https://api.steampowered.com/ITwoFactorService/FinalizeAddAuthenticator/v1/?access_token=" + this.Session.AccessToken), "POST", finalizeAuthenticatorValues);
+                    byte[] finalizeAuthenticatorResult = await wc.UploadValuesTaskAsync(new Uri($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/FinalizeAddAuthenticator/v1/?access_token=" + this.Session.AccessToken), "POST", finalizeAuthenticatorValues);
                     finalizeAuthenticatorResultStr = Encoding.UTF8.GetString(finalizeAuthenticatorResult);
                 }
 
@@ -207,11 +210,146 @@ namespace SteamAuth
             return FinalizeResult.GeneralFailure;
         }
 
+        public async Task<LinkResult> BeginMoveAuthenticatorAsync()
+        {
+            if (this.ConfirmationEmailSent)
+            {
+                bool isStillWaiting = await _isAccountWaitingForEmailConfirmation();
+                if (isStillWaiting)
+                {
+                    return LinkResult.MustConfirmEmail;
+                }
+
+                var sendSmsCpde = await _sendPhoneVerificationCode();
+                if (!sendSmsCpde)
+                {
+                    return LinkResult.AddPhoneError;
+                }
+
+                this.ConfirmationEmailSent = false;
+
+                await Task.Delay(2000);
+                return LinkResult.AwaitingFinalizationAddPhone;
+            }
+
+            var accountPhoneStatus = await queryAccountPhoneStatusAsync();
+            if (!accountPhoneStatus.VerifiedPhone)
+            {
+                if (string.IsNullOrWhiteSpace(PhoneNumber))
+                {
+                    return LinkResult.MustProvidePhoneNumber;
+                }
+
+                string countryCode = this.PhoneCountryCode;
+                if (string.IsNullOrEmpty(countryCode))
+                {
+                    countryCode = await getUserCountry();
+                }
+
+                var res = await _setAccountPhoneNumber(this.PhoneNumber, countryCode);
+                if (!string.IsNullOrWhiteSpace(res?.Response?.ConfirmationEmailAddress))
+                {
+                    this.ConfirmationEmailAddress = res.Response.ConfirmationEmailAddress;
+                    this.ConfirmationEmailSent = true;
+                    return LinkResult.MustConfirmEmail;
+                }
+            }
+
+            var authenticatorStatus = await queryAuthenticatorStatusAsync();
+            if (string.IsNullOrWhiteSpace(authenticatorStatus?.DeviceId))
+            {
+                return LinkResult.MoveAuthenticatorFail;
+            }
+
+            this.DeviceID = authenticatorStatus.DeviceId;
+
+            var response = await SteamWeb.POSTRequest<BeginMoveAuthenticatorResponse>($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/RemoveAuthenticatorViaChallengeStart/v1/?" +
+               $"access_token={Uri.EscapeDataString(Session.AccessToken)}",
+               null, null);
+
+            return response.EResult == ErrorCodes.OK ? LinkResult.AwaitingFinalizeMoveAuthenticator : LinkResult.SendSmsCodeError;
+        }
+
+        public async Task<ErrorCodes> FinalizeMoveAuthenticatorAsync(string smsCode, int version = 2)
+        {
+            var @params = new NameValueCollection
+            {
+                {"sms_code",smsCode },
+                {"version",$"{version}" },
+                {"generate_new_token","1" }
+            };
+
+            var response = await SteamWeb.POSTRequest<FinalizeMoveAuthenticatorResponse>($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/RemoveAuthenticatorViaChallengeContinue/v1/?" +
+               $"access_token={Uri.EscapeDataString(Session.AccessToken)}",
+               null, @params);
+
+            if (string.IsNullOrWhiteSpace(response.Response?.ReplacementToken?.SharedSecret))
+            {
+                return response.EResult;
+            }
+
+            LinkedAccount = new SteamGuardAccount
+            {
+                AccountName = response.Response.ReplacementToken.AccountName,
+                Secret1 = response.Response.ReplacementToken.Secret1,
+                SharedSecret = response.Response.ReplacementToken.SharedSecret,
+                IdentitySecret = response.Response.ReplacementToken.IdentitySecret,
+                RevocationCode = response.Response.ReplacementToken.RevocationCode,
+                TokenGID = response.Response.ReplacementToken.TokenGID,
+                SerialNumber = response.Response.ReplacementToken.SerialNumber,
+                URI = response.Response.ReplacementToken.URI,
+                ServerTime = response.Response.ReplacementToken.ServerTime,
+                FullyEnrolled = true,
+                Status = 0,
+                DeviceID = DeviceID,
+                Session = Session
+            };
+
+            return ErrorCodes.OK;
+        }
+
+        public async Task<ErrorCodes> VerifyAccountPhoneWithCodeAsync(string smsCode)
+        {
+            var @params = new NameValueCollection
+            {
+                { "code",smsCode }
+            };
+            var response = await SteamWeb.POSTRequest<FinalizeMoveAuthenticatorResponse>($"{APIEndpoints.STEAMAPI_BASE}/IPhoneService/VerifyAccountPhoneWithCode/v1/?" +
+                $"access_token={Uri.EscapeDataString(Session.AccessToken)}",
+                null, @params);
+
+            return response.EResult;
+        }
+
+
+        private async Task<QueryAuthenticatorStatusResponse> queryAuthenticatorStatusAsync()
+        {
+            var @params = new NameValueCollection
+            {
+                {"steamid",$"{Session.SteamID}" }
+            };
+
+            var response = await SteamWeb.POSTRequest<QueryAuthenticatorStatusResponse>($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/QueryStatus/v1/?" +
+                $"access_token={Uri.EscapeDataString(Session.AccessToken)}",
+              null, @params);
+
+            return response.Response;
+        }
+
+        private async Task<QueryAccountPhoneStatusResponse> queryAccountPhoneStatusAsync()
+        {
+            var response = await SteamWeb.POSTRequest<QueryAccountPhoneStatusResponse>($"{APIEndpoints.STEAMAPI_BASE}/IPhoneService/AccountPhoneStatus/v1/?" +
+                $"access_token={Uri.EscapeDataString(Session.AccessToken)}",
+              null, null);
+
+            return response.Response;
+        }
+
         private async Task<string> getUserCountry()
         {
             NameValueCollection getCountryBody = new NameValueCollection();
             getCountryBody.Add("steamid", this.Session.SteamID.ToString());
-            string getCountryResponseStr = await SteamWeb.POSTRequest("https://api.steampowered.com/IUserAccountService/GetUserCountry/v1?access_token=" + this.Session.AccessToken, null, getCountryBody);
+            string getCountryResponseStr = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/IUserAccountService/GetUserCountry/v1?access_token=" + this.Session.AccessToken, null, getCountryBody);
 
             // Parse response json to object
             GetUserCountryResponse response = JsonConvert.DeserializeObject<GetUserCountryResponse>(getCountryResponseStr);
@@ -223,13 +361,13 @@ namespace SteamAuth
             NameValueCollection setPhoneBody = new NameValueCollection();
             setPhoneBody.Add("phone_number", phoneNumber);
             setPhoneBody.Add("phone_country_code", countryCode);
-            string getCountryResponseStr = await SteamWeb.POSTRequest("https://api.steampowered.com/IPhoneService/SetAccountPhoneNumber/v1?access_token=" + this.Session.AccessToken, null, setPhoneBody);
+            string getCountryResponseStr = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/IPhoneService/SetAccountPhoneNumber/v1?access_token=" + this.Session.AccessToken, null, setPhoneBody);
             return JsonConvert.DeserializeObject<SetAccountPhoneNumberResponse>(getCountryResponseStr);
         }
 
         private async Task<bool> _isAccountWaitingForEmailConfirmation()
         {
-            string waitingForEmailResponse = await SteamWeb.POSTRequest("https://api.steampowered.com/IPhoneService/IsAccountWaitingForEmailConfirmation/v1?access_token=" + this.Session.AccessToken, null, null);
+            string waitingForEmailResponse = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/IPhoneService/IsAccountWaitingForEmailConfirmation/v1?access_token=" + this.Session.AccessToken, null, null);
 
             // Parse response json to object
             var response = JsonConvert.DeserializeObject<IsAccountWaitingForEmailConfirmationResponse>(waitingForEmailResponse);
@@ -238,8 +376,8 @@ namespace SteamAuth
 
         private async Task<bool> _sendPhoneVerificationCode()
         {
-            await SteamWeb.POSTRequest("https://api.steampowered.com/IPhoneService/SendPhoneVerificationCode/v1?access_token=" + this.Session.AccessToken, null, null);
-            return true;
+            var res = await SteamWeb.POSTRequest<SendPhoneVerificationCodeResponse>($"{APIEndpoints.STEAMAPI_BASE}/IPhoneService/SendPhoneVerificationCode/v1?access_token=" + this.Session.AccessToken, null, null);
+            return res.EResult == ErrorCodes.OK;
         }
 
         public enum LinkResult
@@ -250,7 +388,13 @@ namespace SteamAuth
             AwaitingFinalization, //Must provide an SMS code
             GeneralFailure, //General failure (really now!)
             AuthenticatorPresent,
-            FailureAddingPhone
+            FailureAddingPhone,
+            BeginMoveAuthenticator,
+            AwaitingFinalizeMoveAuthenticator,
+            MoveAuthenticatorFail,
+            AwaitingFinalizationAddPhone,
+            AddPhoneError,
+            SendSmsCodeError
         }
 
         public enum FinalizeResult
@@ -328,6 +472,121 @@ namespace SteamAuth
                 [JsonProperty("status")]
                 public int Status { get; set; }
             }
+        }
+
+        private class SendPhoneVerificationCodeResponse
+        {
+        }
+
+        public class VerifyAccountPhoneWithCodeResponse
+        {
+        }
+
+        private class BeginMoveAuthenticatorResponse
+        {
+        }
+
+        private class FinalizeMoveAuthenticatorResponse
+        {
+            [JsonProperty("success")]
+            public bool Success { get; set; }
+
+            [JsonProperty("replacement_token")]
+            public AuthenticatorToken ReplacementToken { get; set; }
+
+            public class AuthenticatorToken
+            {
+                [JsonProperty("steamid")]
+                public string SteamId { get; set; } = string.Empty;
+
+                [JsonProperty("shared_secret")]
+                public string SharedSecret { get; set; } = string.Empty;
+
+                [JsonProperty("identity_secret")]
+                public string IdentitySecret { get; set; } = string.Empty;
+
+                [JsonProperty("serial_number")]
+                public string SerialNumber { get; set; } = string.Empty;
+
+                [JsonProperty("revocation_code")]
+                public string RevocationCode { get; set; } = string.Empty;
+
+                [JsonProperty("uri")]
+                public string URI { get; set; } = string.Empty;
+
+                [JsonProperty("server_time")]
+                public long ServerTime { get; set; }
+
+                [JsonProperty("account_name")]
+                public string AccountName { get; set; } = string.Empty;
+
+                [JsonProperty("token_gid")]
+                public string TokenGID { get; set; } = string.Empty;
+
+                [JsonProperty("secret_1")]
+                public string Secret1 { get; set; } = string.Empty;
+
+                [JsonProperty("steamguard_scheme")]
+                public int GuardScheme { get; set; }
+            }
+        }
+
+        private class QueryAuthenticatorStatusResponse
+        {
+            [JsonProperty("state")]
+            public int State { get; set; }
+
+            [JsonProperty("device_identifier")]
+            public string DeviceId { get; set; } = string.Empty;
+
+            [JsonProperty("steamguard_scheme")]
+            public int GuardScheme { get; set; }
+
+            [JsonProperty("token_gid")]
+            public string TokenGID { get; set; } = string.Empty;
+
+            [JsonProperty("version")]
+            public int Version { get; set; }
+
+            [JsonProperty("inactivation_reason")]
+            public int InactivationReason { get; set; }
+
+            [JsonProperty("authenticator_type")]
+            public int AuthenticatorType { get; set; }
+
+            [JsonProperty("authenticator_allowed")]
+            public bool AuthenticatorAllowed { get; set; }
+
+            [JsonProperty("email_validated")]
+            public bool EmailValidated { get; set; }
+
+            [JsonProperty("time_created")]
+            public long TimeCreated { get; set; }
+
+            [JsonProperty("time_transferred")]
+            public long TimeTransferred { get; set; }
+
+
+            [JsonProperty("revocation_attempts_remaining")]
+            public int RevocationAttemptsRemaining { get; set; }
+
+            [JsonProperty("classified_agent")]
+            public string ClassifiedAgent { get; set; } = string.Empty;
+        }
+
+        private class QueryAccountPhoneStatusResponse
+        {
+            /// <summary>
+            /// 是否已验证手机号
+            /// </summary>
+            [JsonProperty("verified_phone")]
+            public bool VerifiedPhone { get; set; }
+
+            /// <summary>
+            /// 
+            /// </summary>
+            [JsonProperty("can_add_two_factor_phone")]
+            public bool CanAddTwoFactorPhone { get; set; }
         }
 
         public static string GenerateDeviceID()

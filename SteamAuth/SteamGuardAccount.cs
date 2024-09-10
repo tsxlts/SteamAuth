@@ -66,7 +66,7 @@ namespace SteamAuth
             postBody.Add("revocation_code", this.RevocationCode);
             postBody.Add("revocation_reason", "1");
             postBody.Add("steamguard_scheme", scheme.ToString());
-            string response = await SteamWeb.POSTRequest("https://api.steampowered.com/ITwoFactorService/RemoveAuthenticator/v1?access_token=" + this.Session.AccessToken, null, postBody);
+            string response = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/ITwoFactorService/RemoveAuthenticator/v1?access_token=" + this.Session.AccessToken, null, postBody);
 
             // Parse to object
             var removeResponse = JsonConvert.DeserializeObject<RemoveAuthenticatorResponse>(response);

@@ -32,7 +32,7 @@ namespace SteamAuth
                 var postData = new NameValueCollection();
                 postData.Add("refresh_token", this.RefreshToken);
                 postData.Add("steamid", this.SteamID.ToString());
-                responseStr = await SteamWeb.POSTRequest("https://api.steampowered.com/IAuthenticationService/GenerateAccessTokenForApp/v1/", null, postData);
+                responseStr = await SteamWeb.POSTRequest($"{APIEndpoints.STEAMAPI_BASE}/IAuthenticationService/GenerateAccessTokenForApp/v1/", null, postData);
             }
             catch (Exception ex)
             {
@@ -83,13 +83,10 @@ namespace SteamAuth
                 this.SessionID = GenerateSessionID();
 
             var cookies = new CookieContainer();
-            foreach (string domain in new string[] { "steamcommunity.com", "store.steampowered.com" })
-            {
-                cookies.Add(new Cookie("steamLoginSecure", this.GetSteamLoginSecure(), "/", domain));
-                cookies.Add(new Cookie("sessionid", this.SessionID, "/", domain));
-                cookies.Add(new Cookie("mobileClient", "android", "/", domain));
-                cookies.Add(new Cookie("mobileClientVersion", "777777 3.6.4", "/", domain));
-            }
+            cookies.Add(new Cookie("steamLoginSecure", this.GetSteamLoginSecure(), "/", "steamcommunity.com"));
+            cookies.Add(new Cookie("sessionid", this.SessionID, "/", "steamcommunity.com"));
+            cookies.Add(new Cookie("mobileClient", "android", "/", "steamcommunity.com"));
+            cookies.Add(new Cookie("mobileClientVersion", "777777 3.6.1", "/", "steamcommunity.com"));
             return cookies;
         }
 
